@@ -25,15 +25,29 @@ A proxy service that converts Qwen Chat to an OpenAI-compatible API.
 
 ## Deployment
 
-### Docker
+> Platform differences in **authentication token acquisition** directly affect
+> chat stability. Read the [Platform Comparison](#platform-comparison) first.
+
+### Local NodeJS / Docker (Recommended)
+
+These run a full Node runtime and can launch headless **Chromium to run the real
+baxia SDK**, producing stable auth tokens that are rarely blocked by upstream.
 
 ```bash
-# Build image
-docker build -t qwen2api .
+# Local
+npm install
+node index.js            # default port 8765 (override with PORT)
 
-# Run container
-docker run -d -p 8765:8765 -e API_TOKENS=your_token qwen2api
+# Docker build + run
+docker build -t qwen2api .
+# NOTE: Chromium inside the container needs enough shared memory -- always add --shm-size
+docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 ```
+
+- The image is Debian-based and bundles `chromium`, `ffmpeg`, and `yt-dlp`.
+- `CHROME_PATH=/usr/bin/chromium` locates the browser automatically (see env table).
+- If Chromium cannot run in your environment, set `USE_CHROME_BAXIA=false` to fall
+  back to the simplified token (less stable).
 
 ### Hugging Face Spaces (Docker)
 
@@ -50,6 +64,10 @@ docker run -d -p 8765:8765 -e API_TOKENS=your_token qwen2api
 2. Import the project in Vercel
 3. Optional: Set environment variable `API_TOKENS`
 
+> Vercel is a serverless platform and **cannot run Chromium**, so it only uses
+> the simplified token path. It may be intermittently blocked by upstream risk
+> control; stability is lower than local/Docker.
+
 ### Netlify
 
 [![Deploy to Netlify](https://www.netlify.com/img/deploy/button.svg)](https://app.netlify.com/start/deploy?repository=https://github.com/smanx/qwen2api)
@@ -57,6 +75,9 @@ docker run -d -p 8765:8765 -e API_TOKENS=your_token qwen2api
 1. Fork this repository
 2. Import the project in Netlify
 3. Optional: Set environment variable `API_TOKENS`
+
+> Netlify Edge Functions are also serverless and **cannot run Chromium**, so
+> behavior is similar to Vercel: simplified token + automatic retry, limited stability.
 
 ### Cloudflare Workers
 
@@ -72,6 +93,19 @@ wrangler deploy
 ```
 
 Set the environment variable `API_TOKENS` in the Cloudflare Dashboard.
+
+> Cloudflare Workers are also serverless and cannot run Chromium; only the
+> simplified token is available.
+
+### Platform Comparison
+
+| Aspect | Local Node / Docker | Vercel / Netlify / CF Workers |
+|--------|---------------------|-------------------------------|
+| Chromium (real baxia SDK) | ✅ Yes (stable token) | ❌ No |
+| Token acquisition | Real `T2gAv_` token + cookies (25-min cache) | Simplified token (`wu.json`), low stability |
+| Upstream risk control | Rarely blocked | Intermittently blocked (mitigated by retry) |
+| Video URL / large files | ✅ Supported (needs yt-dlp) | ❌ Not supported (serverless limits) |
+| Use case | Self-hosted, daily use | Quick deploy, light testing |
 
 ## Public Services
 
@@ -119,6 +153,8 @@ The proxy also accepts legacy message-level `files` / `attachments` arrays for c
 | `API_TOKENS` | API keys, multiple keys separated by commas | No |
 | `CHAT_DETAIL_LOG` | Enable detailed chat/upload logs (`true/1/on/yes` to enable, default off) | No |
 | `JSON_BODY_LIMIT` | Express JSON body size limit (default `20mb`, only for local/Docker Express runtime) | No |
+| `CHROME_PATH` | Path to the Chromium/Chrome executable. Auto-detected from common locations (Windows/macOS/Linux) or `PATH`; usually not needed | No |
+| `USE_CHROME_BAXIA` | Set to `false` to disable Chromium-based real token acquisition and fall back to the simplified token (for serverless or browser-less environments) | No |
 
 > **Note:** Web search is now enabled by default for all models. The `ENABLE_SEARCH` variable has been deprecated.
 
@@ -154,7 +190,7 @@ curl https://your-domain/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your_token" \
   -d '{
-    "model": "qwen3.5-plus",
+    "model": "qwen3.8-max",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
   }'
@@ -164,7 +200,7 @@ curl https://your-domain/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your_token" \
   -d '{
-    "model": "qwen3.5-plus",
+    "model": "qwen3.8-max",
     "prompt": "A cute kitten in a garden",
     "n": 1,
     "size": "1:1",
@@ -176,7 +212,7 @@ curl https://your-domain/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your_token" \
   -d '{
-    "model": "qwen3.5-plus",
+    "model": "qwen3.8-max",
     "prompt": "A beautiful landscape",
     "n": 1,
     "size": "1024x1024",
@@ -190,7 +226,7 @@ curl https://your-domain/v1/images/generations \
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `model` | string | No | Model name, default: `qwen3.5-plus` |
+| `model` | string | No | Model name, default: `qwen3.8-max` |
 | `prompt` | string | Yes | Image description text |
 | `n` | number | No | Number of images to generate, default: 1, max: 10 |
 | `size` | string | No | Image size/ratio, default: `1:1` |
@@ -247,7 +283,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="qwen3.5-plus",
+    model="qwen3.8-max",
     messages=[{"role": "user", "content": "Hello!"}],
     stream=True
 )
@@ -265,7 +301,7 @@ const client = new OpenAI({
 });
 
 const stream = await client.chat.completions.create({
-  model: 'qwen3.5-plus',
+  model: 'qwen3.8-max',
   messages: [{ role: 'user', content: 'Hello!' }],
   stream: true
 });
@@ -277,10 +313,13 @@ for await (const chunk of stream) {
 
 ## Supported Models
 
-- `qwen3.5-plus`
-- `qwen3.5-flash`
-- `qwen3.5-turbo`
+- `qwen3.8-max`
+- `qwen3.7-plus`
+- `qwen3.7-max`
 - And other models supported by Qwen Chat
+
+> The model list is scraped dynamically from `chat.qwen.ai`; `/v1/models` returns
+> the latest available models.
 
 ## Project Structure
 
@@ -291,8 +330,11 @@ qwen2api/
 ├── api/
 │   └── index.js         # Vercel entry point
 ├── netlify/
-│   └── functions/
+│   └── edge-functions/
 │       └── api.js       # Netlify entry point
+├── scripts/
+│   ├── baxia-token.js   # Get token via real baxia SDK using Chromium (local/Docker)
+│   └── tampermonkey.js  # Optional browser script
 ├── worker.js            # Cloudflare Workers entry point
 ├── Dockerfile
 ├── vercel.json

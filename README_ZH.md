@@ -16,15 +16,28 @@
 
 ## 部署方式
 
-### Docker
+> 不同平台在**认证凭证获取**上有本质区别，直接影响对话稳定性，请先阅读
+> [平台差异对比](#平台差异对比)。
+
+### 本地 NodeJS / Docker（推荐）
+
+这两种部署运行完整的 Node 运行时，**可以启动无头 Chromium 运行真实 baxia SDK**，
+获取稳定的认证 token，对话几乎不被上游风控。
 
 ```bash
-# 构建镜像
-docker build -t qwen2api .
+# 本地运行
+npm install
+node index.js            # 默认端口 8765（可通过 PORT 修改）
 
-# 运行容器
-docker run -d -p 8765:8765 -e API_TOKENS=your_token qwen2api
+# Docker 构建 + 运行
+docker build -t qwen2api .
+# 注意：容器内跑 Chromium 需要足够的共享内存，务必加 --shm-size
+docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 ```
+
+- 镜像基于 Debian，内置 `chromium`、`ffmpeg`、`yt-dlp`。
+- 容器内通过 `CHROME_PATH=/usr/bin/chromium` 自动定位浏览器（见环境变量表）。
+- 若某些环境无法运行 Chromium，可用 `USE_CHROME_BAXIA=false` 回退到简化 token（稳定性下降）。
 
 ### Vercel
 
@@ -34,6 +47,9 @@ docker run -d -p 8765:8765 -e API_TOKENS=your_token qwen2api
 2. 在 Vercel 中导入项目
 3. 可选：设置环境变量 `API_TOKENS`
 
+> Vercel 是无服务器（serverless）环境，**无法运行 Chromium**，因此只能使用
+> 简化的 token 获取方式。可能间歇性被上游风控，稳定性不如本地/Docker。
+
 ### Netlify
 
 [![Deploy to Netlify](https://www.netlify.com/img/deploy/button.svg)](https://app.netlify.com/start/deploy?repository=https://github.com/smanx/qwen2api)
@@ -41,6 +57,36 @@ docker run -d -p 8765:8765 -e API_TOKENS=your_token qwen2api
 1. Fork 本仓库
 2. 在 Netlify 中导入项目
 3. 可选：设置环境变量 `API_TOKENS`
+
+> Netlify Edge Function 同样是无服务器环境，**无法运行 Chromium**，行为与
+> Vercel 类似：走简化 token + 自动重试，稳定性有限。
+
+### Cloudflare Workers
+
+```bash
+# 安装 wrangler
+npm install -g wrangler
+
+# 登录
+wrangler login
+
+# 部署
+wrangler deploy
+```
+
+在 Cloudflare Dashboard 中设置环境变量 `API_TOKENS`。
+
+> Cloudflare Workers 同样是无服务器环境，无法运行 Chromium，只能使用简化 token。
+
+### 平台差异对比
+
+| 维度 | 本地 Node / Docker | Vercel / Netlify / Cloudflare Workers |
+|------|-------------------|----------------------------------------|
+| Chromium（真实 baxia SDK） | ✅ 支持（生成稳定 token） | ❌ 不支持 |
+| token 获取方式 | 真实 `T2gAv_` token + cookies（缓存 25 分钟） | 简化 token（`wu.json`），有效性与稳定性低 |
+| 上游风控 | 几乎不被拦 | 可能间歇性被拦（自动重试缓解） |
+| 视频链接 / 大文件分析 | ✅ 支持（需 yt-dlp） | ❌ 不支持（serverless 限制） |
+| 适用场景 | 自建服务器、日常使用 | 快速部署、轻量试用 |
 
 ### Cloudflare Workers
 
@@ -103,6 +149,8 @@ wrangler deploy
 | `API_TOKENS` | API 密钥，多个用逗号分隔 | 否 |
 | `CHAT_DETAIL_LOG` | 是否开启详细对话/上传日志（`true/1/on/yes` 开启，默认关闭） | 否 |
 | `JSON_BODY_LIMIT` | Express JSON 请求体大小上限（默认 `20mb`，仅本地/Docker 的 Express 运行时生效） | 否 |
+| `CHROME_PATH` | Chromium/Chrome 可执行文件路径。默认自动探测常见位置（Windows/macOS/Linux）或 `PATH`，一般无需设置 | 否 |
+| `USE_CHROME_BAXIA` | 设为 `false` 时禁用 Chromium 拿真实 token，回退到简化 token（serverless 或不想依赖浏览器时用） | 否 |
 
 > **注意：** `ENABLE_SEARCH` 已不推荐使用。当前版本仍兼容读取该变量（`true` 时启用 `search`，否则使用 `t2t`），后续版本可能移除，请尽量不要依赖。
 >
@@ -140,7 +188,7 @@ curl https://your-domain/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your_token" \
   -d '{
-    "model": "qwen3.5-plus",
+    "model": "qwen3.8-max",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
   }'
@@ -150,7 +198,7 @@ curl https://your-domain/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your_token" \
   -d '{
-    "model": "qwen3.5-plus",
+    "model": "qwen3.8-max",
     "prompt": "一只可爱的小猫在花园里",
     "n": 1,
     "size": "1:1",
@@ -162,7 +210,7 @@ curl https://your-domain/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your_token" \
   -d '{
-    "model": "qwen3.5-plus",
+    "model": "qwen3.8-max",
     "prompt": "一片壮丽的山水风景",
     "n": 1,
     "size": "1024x1024",
@@ -176,7 +224,7 @@ curl https://your-domain/v1/images/generations \
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `model` | string | 否 | 模型名称，默认为 `qwen3.5-plus` |
+| `model` | string | 否 | 模型名称，默认为 `qwen3.8-max` |
 | `prompt` | string | 是 | 图片描述文本 |
 | `n` | number | 否 | 生成图片数量，默认为 1，最大 10 |
 | `size` | string | 否 | 图片尺寸/比例，默认为 `1:1` |
@@ -233,7 +281,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="qwen3.5-plus",
+    model="qwen3.8-max",
     messages=[{"role": "user", "content": "Hello!"}],
     stream=True
 )
@@ -251,7 +299,7 @@ const client = new OpenAI({
 });
 
 const stream = await client.chat.completions.create({
-  model: 'qwen3.5-plus',
+  model: 'qwen3.8-max',
   messages: [{ role: 'user', content: 'Hello!' }],
   stream: true
 });
@@ -263,10 +311,12 @@ for await (const chunk of stream) {
 
 ## 支持的模型
 
-- `qwen3.5-plus`
-- `qwen3.5-flash`
-- `qwen3.5-turbo`
+- `qwen3.8-max`
+- `qwen3.7-plus`
+- `qwen3.7-max`
 - 以及 Qwen Chat 支持的其他模型
+
+> 模型列表会从上游 `chat.qwen.ai` 动态抓取，`/v1/models` 返回最新可用模型。
 
 ## 项目结构
 
@@ -277,8 +327,11 @@ qwen2api/
 ├── api/
 │   └── index.js         # Vercel 入口
 ├── netlify/
-│   └── functions/
+│   └── edge-functions/
 │       └── api.js       # Netlify 入口
+├── scripts/
+│   ├── baxia-token.js   # 用 Chromium 运行真实 baxia SDK 获取 token（本地/Docker 用）
+│   └── tampermonkey.js  # 浏览器脚本（可选）
 ├── worker.js            # Cloudflare Workers 入口
 ├── Dockerfile
 ├── vercel.json

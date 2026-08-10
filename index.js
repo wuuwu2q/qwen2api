@@ -4,7 +4,7 @@
  * 支持: Docker (Express) / Vercel / Netlify
  */
 
-const { handleModels, handleChatCompletions, handleChatCompletionsWithLogs, handleImageGenerations, handleRoot, handleChatPage, createResponse, validateToken, uuidv4, mapUpstreamDeltaToOpenAI } = require('./core.js');
+const { handleModels, handleChatCompletions, handleChatCompletionsWithLogs, handleImageGenerations, handleRoot, handleChatPage, createResponse, validateToken, uuidv4, mapUpstreamDeltaToOpenAI, tryParseUpstreamErrorPayload } = require('./core.js');
 
 function tryParseJson(text) {
   if (typeof text !== 'string') return null;
@@ -146,6 +146,8 @@ function createExpressStreamHandler(res) {
     const decoder = new TextDecoder();
     let buffer = '';
     let doneWritten = false;
+    let anyChunkWritten = false;
+    let nonDataBuffer = '';
 
     try {
       if (!reader) {
@@ -162,7 +164,10 @@ function createExpressStreamHandler(res) {
 
         for (const line of lines) {
           const trimmed = line.trimStart();
-          if (!trimmed.startsWith('data:')) continue;
+          if (!trimmed.startsWith('data:')) {
+            nonDataBuffer += line + '\n';
+            continue;
+          }
           const data = trimmed.slice(5).trim();
           if (data === '[DONE]') {
             res.write('data: [DONE]\n\n');
@@ -201,6 +206,7 @@ function createExpressStreamHandler(res) {
                 }
               };
               res.write(`data: ${JSON.stringify(errObj)}\n\n`);
+              anyChunkWritten = true;
               continue;
             }
 
@@ -221,8 +227,20 @@ function createExpressStreamHandler(res) {
                 }],
               };
               res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              anyChunkWritten = true;
             }
           } catch {}
+        }
+      }
+      if (buffer.trim() && !buffer.trimStart().startsWith('data:')) {
+        nonDataBuffer += buffer;
+      }
+      if (!doneWritten && !anyChunkWritten) {
+        const err = tryParseUpstreamErrorPayload(nonDataBuffer);
+        if (err) {
+          res.write(`data: ${JSON.stringify({ error: err })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          doneWritten = true;
         }
       }
     } catch (err) {
