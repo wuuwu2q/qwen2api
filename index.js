@@ -4,7 +4,7 @@
  * 支持: Docker (Express) / Vercel / Netlify
  */
 
-const { handleModels, handleChatCompletions, handleChatCompletionsWithLogs, handleImageGenerations, handleRoot, handleChatPage, createResponse, validateToken, uuidv4, mapUpstreamDeltaToOpenAI, tryParseUpstreamErrorPayload } = require('./core.js');
+const { handleModels, handleChatCompletions, handleChatCompletionsWithLogs, handleImageGenerations, handleRoot, handleChatPage, createResponse, validateToken, uuidv4, mapUpstreamDeltaToOpenAI, tryParseUpstreamErrorPayload, createExpressStreamHandler, createExpressLogStreamHandler } = require('./core.js');
 
 function tryParseJson(text) {
   if (typeof text !== 'string') return null;
@@ -117,182 +117,6 @@ function patchDnsForHuggingFace() {
   } catch (err) {
     console.log(`[qwen2api][startup][dns] 跳过 DNS 配置: ${err && err.message ? err.message : String(err)}`);
   }
-}
-
-// ============================================
-// Express Stream Handler
-// ============================================
-
-function createExpressStreamHandler(res) {
-  return async (response, model, responseId, created) => {
-    const rawFlag = process.env.CHAT_DETAIL_LOG || '';
-    const debugEnabled = ['1', 'true', 'yes', 'on'].includes(String(rawFlag).toLowerCase());
-    let hasStreamContent = false;
-
-    const writeStreamContent = (content) => {
-      if (!debugEnabled || !content) return;
-      hasStreamContent = true;
-      process.stdout.write(content);
-    };
-
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    
-    const reader = response.body?.getReader ? response.body.getReader() : null;
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let doneWritten = false;
-    let anyChunkWritten = false;
-    let nonDataBuffer = '';
-
-    try {
-      if (!reader) {
-        throw new Error('Upstream response has no readable body');
-      }
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          const trimmed = line.trimStart();
-          if (!trimmed.startsWith('data:')) {
-            nonDataBuffer += line + '\n';
-            continue;
-          }
-          const data = trimmed.slice(5).trim();
-          if (data === '[DONE]') {
-            res.write('data: [DONE]\n\n');
-            doneWritten = true;
-            continue;
-          }
-
-          try {
-            const parsed = JSON.parse(data);
-            if (parsed?.error) {
-              const upstreamError = typeof parsed.error === 'string' ? { message: parsed.error } : parsed.error;
-              const errorMsg = upstreamError.message || upstreamError.details || '请求失败';
-              // 内容安全警告作为正常输出而不是错误
-              if (upstreamError.code === 'data_inspection_failed' || upstreamError.details) {
-                const warningChunk = {
-                  id: responseId,
-                  object: 'chat.completion.chunk',
-                  created,
-                  model,
-                  choices: [{
-                    index: 0,
-                    delta: { role: 'assistant', content: errorMsg },
-                    finish_reason: 'stop',
-                  }],
-                };
-                res.write(`data: ${JSON.stringify(warningChunk)}\n\n`);
-                doneWritten = true;
-                res.write('data: [DONE]\n\n');
-                continue;
-              }
-              const errObj = {
-                error: {
-                  message: errorMsg,
-                  type: upstreamError.type || 'api_error',
-                  code: upstreamError.code,
-                }
-              };
-              res.write(`data: ${JSON.stringify(errObj)}\n\n`);
-              anyChunkWritten = true;
-              continue;
-            }
-
-            const delta = mapUpstreamDeltaToOpenAI(parsed?.choices?.[0]?.delta);
-            if (delta || parsed?.choices?.[0]?.finish_reason) {
-              if (delta && typeof delta.content === 'string' && delta.content) {
-                writeStreamContent(delta.content);
-              }
-              const chunk = {
-                id: responseId,
-                object: 'chat.completion.chunk',
-                created,
-                model,
-                choices: [{
-                  index: 0,
-                  delta: delta || {},
-                  finish_reason: parsed?.choices?.[0]?.finish_reason || null,
-                }],
-              };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-              anyChunkWritten = true;
-            }
-          } catch {}
-        }
-      }
-      if (buffer.trim() && !buffer.trimStart().startsWith('data:')) {
-        nonDataBuffer += buffer;
-      }
-      if (!doneWritten && !anyChunkWritten) {
-        const err = tryParseUpstreamErrorPayload(nonDataBuffer);
-        if (err) {
-          res.write(`data: ${JSON.stringify({ error: err })}\n\n`);
-          res.write('data: [DONE]\n\n');
-          doneWritten = true;
-        }
-      }
-    } catch (err) {
-      if (!res.writableEnded) {
-        const message = err && err.message ? err.message : 'stream proxy error';
-        res.write(`data: ${JSON.stringify({ error: { message, type: 'api_error' } })}\n\n`);
-      }
-    } finally {
-      if (!doneWritten && !res.writableEnded) {
-        res.write('data: [DONE]\n\n');
-      }
-      if (!res.writableEnded) {
-        res.end();
-      }
-    }
-
-    if (debugEnabled && hasStreamContent) {
-      process.stdout.write('\n');
-      console.log('[qwen2api][express][stream] 输出完毕');
-    }
-  };
-}
-
-// 带日志流式返回的 Express Handler
-function createExpressLogStreamHandler(res) {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-
-  const streamWriter = {
-    write: (data) => {
-      if (!res.writableEnded) {
-        res.write(data);
-      }
-    },
-    log: (logData) => {
-      if (!res.writableEnded) {
-        res.write(`event: log\n`);
-        res.write(`data: ${logData}\n\n`);
-      }
-    },
-    end: () => {
-      if (!res.writableEnded) {
-        res.end();
-      }
-    }
-  };
-
-  return streamWriter;
 }
 
 // ============================================
@@ -508,6 +332,10 @@ function startExpressServer() {
         try {
           const parsed = typeof result.body === 'string' ? JSON.parse(result.body) : result.body;
           if (parsed && parsed.error) {
+            payload = parsed;
+          } else if (result.statusCode >= 200 && result.statusCode < 300 && parsed) {
+            // 非流式成功响应（stream 未传或为 false）：日志事件已开始 SSE，
+            // 将完整 completion 作为 data 事件输出，保证内容仍能送达。
             payload = parsed;
           }
         } catch {}

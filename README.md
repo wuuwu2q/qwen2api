@@ -18,10 +18,113 @@ A proxy service that converts Qwen Chat to an OpenAI-compatible API.
 - 🔄 OpenAI API compatible format
 - 🚀 Streaming response support (SSE)
 - 🔐 Optional API Token authentication
-- 🌐 Multi-platform deployment support
+- 🌐 Multi-platform deployment: Local NodeJS / Docker, Vercel, Netlify, Cloudflare Workers
 - 🖼️ Image generation support
 - 🎬📄 Video analysis, image and document parsing support
 - 💬 Built-in web chat interface
+
+## Architecture Overview
+
+All deployment targets share one codebase: every platform entry (`index.js`,
+`api/index.js`, `netlify/functions/api.js`, `worker.js`) is a thin protocol
+adapter that calls the same `core.js` business logic. Routes, attachment
+uploads, streaming and error handling therefore behave identically everywhere.
+
+```
+                     ┌──────────────────────────────────────┐
+                     │  Clients: OpenAI SDK / curl / the    │
+                     │  built-in /chat web page             │
+                     └──────────────────┬───────────────────┘
+                                        │  OpenAI-compatible HTTP
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Entry adapters (thin wrappers: routing + platform protocol only)        │
+│                                                                          │
+│   index.js              api/index.js       netlify/functions/api.js      │
+│   (Express,             (Vercel Node fn,   (Netlify Node fn,             │
+│    local / Docker)       maxDuration)         timeout)                   │
+│   worker.js                                                              │
+│   (CF Worker, nodejs_compat)                                             │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  core.js — the single business-logic module (bundled into every entry)  │
+│                                                                          │
+│   Routes:  GET  /v1/models                 (model list from upstream)    │
+│            POST /v1/chat/completions       (chat, OpenAI compatible)     │
+│            POST /v1/chat/completions/log   (chat + progress logs;        │
+│                                              video-analysis endpoint)    │
+│            POST /v1/images/generations     (image generation)            │
+│            GET  /chat                      (built-in chat UI)            │
+│            GET  /                          (health check)                │
+│                                                                          │
+│   /chat page:  read chat.html from disk (local dev, always fresh)        │
+│                → fallback to bundled chat-html.js when unreadable        │
+│                  (serverless function environments); regenerate with:    │
+│                  npm run build:chat-html                                 │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │  per-request pipeline
+                                    ▼
+   ①  Auth      validateToken — env API_TOKENS (empty ⇒ open access)
+   ②  Tokens    getBaxiaTokens
+                  ├─ Node + Chromium → real baxia SDK (T2gAv_ + cookies, 25-min cache)
+                  └─ serverless / CF → simplified token (wu.json), auto fallback
+   ③  Session   createChatSession — /api/v2/chats/new, retry with fresh token ×3
+   ④  Parse     messages → text + attachments (image / audio / video / document)
+   ⑤  Video     [only /log endpoint] body.video_url → yt-dlp download
+                  → wrapped as a video attachment
+                  (local/Docker only; serverless returns a clear error)
+   ⑥  Upload    per attachment: bytes → getstsToken → PUT Qwen OSS (V4 signed)
+                  → status poll (skipped for video) → document parse (documents)
+   ⑦  Chat      POST /api/v2/chat/completions (upstream SSE, files=uploaded)
+   ⑧  Respond   stream=true  → live SSE mapping (Express / Vercel / CF)
+                               or buffered SSE, returned whole (Netlify)
+                stream=false → collected JSON chat.completion
+```
+
+### Video analysis flow
+
+Video analysis reuses the **general chat endpoint** (`/v1/chat/completions/log`)
+plus one optional field — no dedicated endpoint is needed. The web chat UI
+auto-switches to this endpoint when a video URL is filled in.
+
+```
+POST /v1/chat/completions/log
+body: {
+  "messages": [...],
+  "stream": true,
+  "video_url": "https://...",      // triggers video analysis
+  "min_video_resolution": 480      // optional, default 480
+}
+
+  ①  yt-dlp downloads the video (resolution: body → env MIN_VIDEO_RESOLUTION → 480)
+  ②  the video becomes a normal 'video' attachment
+  ③  same OSS upload chain as images/files (status polling skipped for video)
+  ④  regular chat completion against the uploaded file
+```
+
+### Platform capabilities
+
+| Capability | Local / Docker | Vercel | Netlify | CF Worker |
+|------------|----------------|--------|---------|-----------|
+| Real baxia token (Chromium) | ✅ | ❌ simplified | ❌ simplified | ❌ simplified |
+| Live SSE streaming | ✅ | ✅ | ⚠️ buffered | ✅ |
+| Video analysis (yt-dlp) | ✅ | ❌ | ❌ | ❌ |
+| Attachment upload (OSS) | ✅ | ✅  | ✅  | ✅  |
+| Chat page `/chat` | ✅ file | ✅ inline | ✅ inline | ✅ inline |
+
+### Design notes
+
+- **`nodeRequire(name)`** loads Node built-ins dynamically. Bundlers never
+  inline them, so the same `core.js` also builds on CF Workers; at runtime a
+  missing module resolves to `null` and callers degrade gracefully (WebCrypto
+  instead of `crypto`, `wu.json` instead of the baxia SDK).
+- **`process` guards** — serverless runtimes may not define `process` at all;
+  every access goes through `typeof process !== 'undefined'` checks.
+- **`chat-html.js`** is generated from `chat.html` by
+  `scripts/build-chat-html.js` (`npm run build:chat-html`) — re-run it after
+  editing `chat.html`.
 
 ## Deployment
 
@@ -49,6 +152,24 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 - If Chromium cannot run in your environment, set `USE_CHROME_BAXIA=false` to fall
   back to the simplified token (less stable).
 
+#### Using the pre-built GHCR image (no local build)
+
+Every push or manual trigger runs a GitHub Actions workflow that builds the image
+and pushes it to **GitHub Container Registry** (see `.github/workflows/docker-build.yml`).
+Pull and run it directly:
+
+```bash
+# Pull the latest image
+docker pull ghcr.io/smanx/qwen2api:latest
+
+# Run (container listens on 7860, mapped to host 8765; Chromium needs shared memory -- always add --shm-size)
+docker run -d -p 8765:7860 --shm-size=2g -e API_TOKENS=your_token ghcr.io/smanx/qwen2api:latest
+```
+
+- Common tags: `latest` (newest build), `master` (branch), `sha-<7-char sha>` (per commit), `vX.Y.Z` (release tags).
+- Pin a specific commit: `docker pull ghcr.io/smanx/qwen2api:sha-<7-char sha>`.
+- The container listens on port `7860`; change the left side of `-p` to remap the host port (e.g. `-p 9000:7860`).
+
 ### Hugging Face Spaces (Docker)
 
 1. Create a new **Docker** Space on Hugging Face.
@@ -67,6 +188,10 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 > Vercel is a serverless platform and **cannot run Chromium**, so it only uses
 > the simplified token path. It may be intermittently blocked by upstream risk
 > control; stability is lower than local/Docker.
+> The Vercel entry (`api/index.js`) uses the **Node.js runtime** and shares the
+> same `core.js` logic as local/Docker and Netlify. Function timeout is set via
+> `module.exports.config.maxDuration` (capped by your Vercel plan); SSE streaming
+> is forwarded in real time (Vercel Node functions support streaming).
 
 ### Netlify
 
@@ -76,8 +201,9 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 2. Import the project in Netlify
 3. Optional: Set environment variable `API_TOKENS`
 
-> Netlify Edge Functions are also serverless and **cannot run Chromium**, so
-> behavior is similar to Vercel: simplified token + automatic retry, limited stability.
+> Netlify Functions (Node runtime) are also serverless and **cannot run Chromium**,
+> so behavior is similar to Vercel: simplified token + automatic retry, limited stability.
+> The function timeout is configured in `netlify.toml` (capped by your Netlify plan); streaming responses are buffered and returned whole.
 
 ### Cloudflare Workers
 
@@ -96,6 +222,10 @@ Set the environment variable `API_TOKENS` in the Cloudflare Dashboard.
 
 > Cloudflare Workers are also serverless and cannot run Chromium; only the
 > simplified token is available.
+> The Worker entry (`worker.js`) is a thin wrapper that reuses the same `core.js`
+> logic as local/Docker, Vercel and Netlify (requires the `nodejs_compat`
+> compatibility flag, already set in `wrangler.toml`). SSE streaming is forwarded
+> in real time. Video URL analysis / yt-dlp are not supported on Workers.
 
 ### Platform Comparison
 
@@ -109,12 +239,13 @@ Set the environment variable `API_TOKENS` in the Cloudflare Dashboard.
 
 ## Public Services
 
-Two public services are available for testing:
+Three public services are available for testing:
 
 | Service URL | Platform |
 |-------------|----------|
 | `https://qwen2api-n.smanx.xx.kg` | Netlify |
 | ~~`https://qwen2api-v.smanx.xx.kg`~~ | ~~Vercel~~ (Usage limit exceeded, service stopped) |
+| `https://qwen2api.smanx.xx.kg` | Cloudflare Workers |
 
 - No API Token required (leave key empty)
 - Self-deployment is recommended for more stable service
@@ -325,17 +456,20 @@ for await (const chunk of stream) {
 
 ```
 qwen2api/
-├── core.js              # Core business logic
-├── index.js             # Docker / Local entry point
+├── chat.html             # Web chat UI source (edit this file)
+├── chat-html.js          # Generated inline copy of chat.html (npm run build:chat-html)
+├── core.js               # Core business logic (shared by all platforms)
+├── index.js              # Docker / Local entry point
 ├── api/
-│   └── index.js         # Vercel entry point
+│   └── index.js          # Vercel entry point (Node runtime, reuses core.js)
 ├── netlify/
-│   └── edge-functions/
-│       └── api.js       # Netlify entry point
+│   └── functions/
+│       └── api.js        # Netlify Functions (Node) entry point
 ├── scripts/
-│   ├── baxia-token.js   # Get token via real baxia SDK using Chromium (local/Docker)
-│   └── tampermonkey.js  # Optional browser script
-├── worker.js            # Cloudflare Workers entry point
+│   ├── baxia-token.js    # Get token via real baxia SDK using Chromium (local/Docker)
+│   ├── build-chat-html.js # Regenerate chat-html.js from chat.html
+│   └── tampermonkey.js   # Optional browser script
+├── worker.js             # Cloudflare Workers entry point (reuses core.js)
 ├── Dockerfile
 ├── vercel.json
 ├── netlify.toml

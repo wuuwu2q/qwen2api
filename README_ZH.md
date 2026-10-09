@@ -9,10 +9,109 @@
 - 🔄 OpenAI API 兼容格式
 - 🚀 支持流式响应 (SSE)
 - 🔐 可选的 API Token 认证
-- 🌐 多平台部署支持
+- 🌐 多平台部署：本地 NodeJS / Docker、Vercel、Netlify、Cloudflare Workers
 - 🖼️ 支持图片生成
 - 🎬📄 支持视频解析、图片与文档解析
 - 💬 内置 Web 聊天界面
+
+## 架构总览（运行全貌）
+
+所有部署形态共用同一套代码：每个平台入口（`index.js`、`api/index.js`、
+`netlify/functions/api.js`、`worker.js`）都只是薄协议适配层，调用同一个
+`core.js` 业务逻辑，因此路由、附件上传、流式、错误处理在各平台行为一致。
+
+```
+                     ┌──────────────────────────────────────┐
+                     │  客户端：OpenAI SDK / curl /          │
+                     │  内置 /chat 聊天页面                  │
+                     └──────────────────┬───────────────────┘
+                                        │  OpenAI 兼容 HTTP
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  入口适配层（薄包装：只做路由与平台协议适配）                              │
+│                                                                          │
+│   index.js              api/index.js       netlify/functions/api.js      │
+│   (Express,             (Vercel Node 函数,  (Netlify Node 函数,           │
+│    本地 / Docker)        maxDuration)         timeout)                    │
+│   worker.js                                                              │
+│   (CF Worker, nodejs_compat)                                             │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  core.js —— 唯一的业务逻辑模块（esbuild 打包进每个入口）                    │
+│                                                                          │
+│   路由:   GET  /v1/models                 （模型列表，动态抓取上游）       │
+│           POST /v1/chat/completions       （对话，OpenAI 兼容）           │
+│           POST /v1/chat/completions/log   （对话+进度日志；               │
+│                                             视频分析专用端点）            │
+│           POST /v1/images/generations     （文生图）                      │
+│           GET  /chat                      （内置聊天页面）                │
+│           GET  /                          （健康检查）                    │
+│                                                                          │
+│   /chat 页面:  磁盘可读时读 chat.html（本地开发实时生效）                  │
+│                读不到时回退到打包进代码的 chat-html.js 内联副本            │
+│                （serverless 函数环境）；重新生成命令：                    │
+│                npm run build:chat-html                                   │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │  单次请求处理流水线
+                                    ▼
+   ①  鉴权     validateToken —— 环境变量 API_TOKENS（为空则开放访问）
+   ②  Token    getBaxiaTokens
+                 ├─ Node + Chromium → 真实 baxia SDK（T2gAv_ + cookies，缓存 25 分钟）
+                 └─ serverless / CF → 简化 token（wu.json），自动降级
+   ③  建会话   createChatSession —— /api/v2/chats/new，失败换 token 重试 3 次
+   ④  解析     消息 → 文本 + 附件（图片 / 音频 / 视频 / 文档）
+   ⑤  视频     [仅 /log 端点] body.video_url → yt-dlp 下载
+                 → 包装成普通 video 附件
+                 （仅本地/Docker；serverless 返回明确错误）
+   ⑥  上传     每个附件：取字节 → getstsToken → PUT 阿里云 OSS（V4 签名）
+                 → 状态轮询（视频跳过）→ 文档解析（仅文档）
+   ⑦  对话     POST /api/v2/chat/completions（上游 SSE 流，files=已上传）
+   ⑧  响应     stream=true  → 实时 SSE 映射（Express / Vercel / CF）
+                              或缓冲后整体返回（Netlify）
+               stream=false → 收集后返回非流式 JSON chat.completion
+```
+
+### 视频分析流程
+
+视频分析**复用通用对话端点**（`/v1/chat/completions/log`）+ 一个可选字段，
+不需要专用新接口。聊天页面填写视频链接后会自动切换到该端点。
+
+```
+POST /v1/chat/completions/log
+body: {
+  "messages": [...],
+  "stream": true,
+  "video_url": "https://...",      // 触发视频分析
+  "min_video_resolution": 480      // 可选，默认 480
+}
+
+  ①  yt-dlp 下载视频（清晰度：请求参数 → 环境变量 MIN_VIDEO_RESOLUTION → 480）
+  ②  视频包装成普通 'video' 附件
+  ③  与图片/文件走同一条 OSS 上传链（视频跳过状态轮询）
+  ④  携带上传文件发起普通对话
+```
+
+### 平台能力对比
+
+| 能力 | 本地 / Docker | Vercel | Netlify | CF Worker |
+|------|---------------|--------|---------|-----------|
+| 真实 baxia token（Chromium） | ✅ | ❌ 简化 | ❌ 简化 | ❌ 简化 |
+| 实时 SSE 流式 | ✅ | ✅ | ⚠️ 缓冲 | ✅ |
+| 视频分析（yt-dlp） | ✅ | ❌ | ❌ | ❌ |
+| 附件上传（OSS） | ✅ | ✅  | ✅  | ✅  |
+| 聊天页 /chat | ✅ 读文件 | ✅ 内联副本 | ✅ 内联副本 | ✅ 内联副本 |
+
+### 设计要点
+
+- **`nodeRequire(name)`** 动态加载 Node 内置模块：打包器不会把它内联，
+  因此同一份 `core.js` 也能在 CF Workers 上构建；运行时模块缺失时返回
+  `null`，调用方优雅降级（WebCrypto 代替 `crypto`、`wu.json` 代替 baxia SDK）。
+- **`process` 防护**——serverless 运行时可能完全没有 `process`，所有访问
+  都经过 `typeof process !== 'undefined'` 判断。
+- **`chat-html.js`** 由 `scripts/build-chat-html.js` 从 `chat.html` 生成
+  （`npm run build:chat-html`）——修改 `chat.html` 后需重新生成。
 
 ## 部署方式
 
@@ -39,6 +138,23 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 - 容器内通过 `CHROME_PATH=/usr/bin/chromium` 自动定位浏览器（见环境变量表）。
 - 若某些环境无法运行 Chromium，可用 `USE_CHROME_BAXIA=false` 回退到简化 token（稳定性下降）。
 
+#### 使用 GHCR 预构建镜像（免本地构建）
+
+每次代码推送或手动触发，GitHub Actions 都会自动构建镜像并推送到
+**GitHub Container Registry**（见 `.github/workflows/docker-build.yml`），可直接拉取使用：
+
+```bash
+# 拉取最新镜像
+docker pull ghcr.io/smanx/qwen2api:latest
+
+# 运行（容器内监听 7860，映射到宿主 8765；Chromium 需要足够共享内存，务必加 --shm-size）
+docker run -d -p 8765:7860 --shm-size=2g -e API_TOKENS=your_token ghcr.io/smanx/qwen2api:latest
+```
+
+- 常用标签：`latest`（最新构建）、`master`（分支名）、`sha-<7位sha>`（每次提交）、`vX.Y.Z`（版本标签）。
+- 想固定到某次提交：`docker pull ghcr.io/smanx/qwen2api:sha-<7位sha>`。
+- 容器内端口为 `7860`，如要改宿主映射端口只需调整 `-p` 左侧（如 `-p 9000:7860`）。
+
 ### Vercel
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/smanx/qwen2api)
@@ -49,6 +165,9 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 
 > Vercel 是无服务器（serverless）环境，**无法运行 Chromium**，因此只能使用
 > 简化的 token 获取方式。可能间歇性被上游风控，稳定性不如本地/Docker。
+> Vercel 入口（`api/index.js`）使用 **Node.js 运行时**，与本地 / Netlify 共用
+> 同一套 `core.js` 逻辑。函数超时通过 `module.exports.config.maxDuration` 配置
+> （上限由 Vercel 计划决定）；SSE 流式响应实时转发（Vercel Node 函数支持流式）。
 
 ### Netlify
 
@@ -58,8 +177,9 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 2. 在 Netlify 中导入项目
 3. 可选：设置环境变量 `API_TOKENS`
 
-> Netlify Edge Function 同样是无服务器环境，**无法运行 Chromium**，行为与
+> Netlify Functions（Node 运行时）同样是无服务器环境，**无法运行 Chromium**，行为与
 > Vercel 类似：走简化 token + 自动重试，稳定性有限。
+> 函数超时在 `netlify.toml` 中配置（上限由 Netlify 计划决定）；流式(SSE)响应会被缓冲后整体返回。
 
 ### Cloudflare Workers
 
@@ -77,6 +197,9 @@ wrangler deploy
 在 Cloudflare Dashboard 中设置环境变量 `API_TOKENS`。
 
 > Cloudflare Workers 同样是无服务器环境，无法运行 Chromium，只能使用简化 token。
+> Worker 入口（`worker.js`）是薄包装，复用与本地 / Vercel / Netlify 相同的 `core.js`
+> 逻辑（依赖 `wrangler.toml` 中已配置的 `nodejs_compat` 标志）。SSE 流式输出实时转发；
+> 视频链接分析（yt-dlp）在 Workers 上不支持。
 
 ### 平台差异对比
 
@@ -88,29 +211,15 @@ wrangler deploy
 | 视频链接 / 大文件分析 | ✅ 支持（需 yt-dlp） | ❌ 不支持（serverless 限制） |
 | 适用场景 | 自建服务器、日常使用 | 快速部署、轻量试用 |
 
-### Cloudflare Workers
-
-```bash
-# 安装 wrangler
-npm install -g wrangler
-
-# 登录
-wrangler login
-
-# 部署
-wrangler deploy
-```
-
-在 Cloudflare Dashboard 中设置环境变量 `API_TOKENS`。
-
 ## 公共服务
 
-提供两个公共服务供测试使用：
+提供三个公共服务供测试使用：
 
 | 服务地址 | 平台 |
 |----------|------|
 | `https://qwen2api-n.smanx.xx.kg` | Netlify |
 | ~~`https://qwen2api-v.smanx.xx.kg`~~ | ~~Vercel~~ （使用超额已停机） |
+| `https://qwen2api.smanx.xx.kg` | Cloudflare Workers |
 
 - 无需 API Token（密钥为空）
 - 建议自行部署以获得更稳定的服务
@@ -322,17 +431,20 @@ for await (const chunk of stream) {
 
 ```
 qwen2api/
-├── core.js              # 核心业务逻辑
-├── index.js             # Docker / 本地入口
+├── chat.html             # Web 聊天页源码（改这个文件）
+├── chat-html.js          # chat.html 的内联副本（npm run build:chat-html 生成）
+├── core.js               # 核心业务逻辑（所有平台共用）
+├── index.js              # Docker / 本地入口
 ├── api/
-│   └── index.js         # Vercel 入口
+│   └── index.js          # Vercel 入口（Node 运行时，复用 core.js）
 ├── netlify/
-│   └── edge-functions/
-│       └── api.js       # Netlify 入口
+│   └── functions/
+│       └── api.js        # Netlify Functions（Node）入口
 ├── scripts/
-│   ├── baxia-token.js   # 用 Chromium 运行真实 baxia SDK 获取 token（本地/Docker 用）
-│   └── tampermonkey.js  # 浏览器脚本（可选）
-├── worker.js            # Cloudflare Workers 入口
+│   ├── baxia-token.js    # 用 Chromium 运行真实 baxia SDK 获取 token（本地/Docker 用）
+│   ├── build-chat-html.js # 从 chat.html 重新生成 chat-html.js
+│   └── tampermonkey.js   # 浏览器脚本（可选）
+├── worker.js             # Cloudflare Workers 入口（复用 core.js）
 ├── Dockerfile
 ├── vercel.json
 ├── netlify.toml
